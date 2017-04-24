@@ -16,32 +16,25 @@
 
 package org.springframework.cloud.deployer.spi.openstack;
 
-import io.fabric8.kubernetes.api.model.*;
-import io.fabric8.kubernetes.client.KubernetesClient;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.openstack4j.api.OSClient;
 import org.openstack4j.model.compute.Server;
-import org.springframework.boot.bind.YamlConfigurationFactory;
 import org.springframework.cloud.deployer.spi.app.AppDeployer;
 import org.springframework.cloud.deployer.spi.app.AppStatus;
 import org.springframework.cloud.deployer.spi.core.AppDeploymentRequest;
 import org.springframework.cloud.deployer.spi.core.RuntimeEnvironmentInfo;
-import org.springframework.cloud.deployer.spi.util.ByteSizeUtils;
 import org.springframework.cloud.deployer.spi.util.RuntimeVersionUtils;
-import org.springframework.util.CollectionUtils;
-import org.springframework.util.StringUtils;
 
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 import static org.springframework.util.CollectionUtils.isEmpty;
 import static org.springframework.util.StringUtils.collectionToCommaDelimitedString;
 
 /**
  * Abstract base class for a deployer that targets OpenStack.
- *
- * @author Dhruv Pratap
  */
 public class AbstractOpenStackDeployer {
 
@@ -53,8 +46,6 @@ public class AbstractOpenStackDeployer {
 
 	protected static final Log logger = LogFactory.getLog(AbstractOpenStackDeployer.class);
 
-	protected ContainerFactory containerFactory;
-
 	protected OSClient client;
 
 	protected OpenStackDeployerProperties properties = new OpenStackDeployerProperties();
@@ -62,7 +53,7 @@ public class AbstractOpenStackDeployer {
 	/**
 	 * Create the RuntimeEnvironmentInfo.
 	 *
-	 * @return the Kubernetes runtime environment info
+	 * @return the OpenStack runtime environment info
 	 */
 	protected RuntimeEnvironmentInfo createRuntimeEnvironmentInfo(Class spiClass, Class implementationClass) {
 		return new RuntimeEnvironmentInfo.Builder()
@@ -70,7 +61,7 @@ public class AbstractOpenStackDeployer {
 				.implementationName(implementationClass.getSimpleName())
 				.implementationVersion(RuntimeVersionUtils.getVersion(implementationClass))
 				.platformType("OpenStack")
-				.platformApiVersion("v3")
+				.platformApiVersion("v2.1")
 				.platformClientVersion(RuntimeVersionUtils.getVersion(client.getClass()))
 				.platformHostVersion("unknown")
 				.addPlatformSpecificInfo("endpoint", client.getEndpoint())
@@ -103,257 +94,6 @@ public class AbstractOpenStackDeployer {
 			}
 		}
 		return statusBuilder.build();
-	}
-
-	/**
-	 * Create a PodSpec to be used for app and task deployments
-	 *
-	 * @param appId the app ID
-	 * @param request app deployment request
-	 * @param port port to use for app or null if none
-	 * @param instanceIndex instance index for app or null if no index
-	 * @param neverRestart use restart policy of Never
-	 * @return the PodSpec
-	 */
-	protected PodSpec createPodSpec(String appId, AppDeploymentRequest request,
-	                                Integer port, Integer instanceIndex, boolean neverRestart) {
-		PodSpecBuilder podSpec = new PodSpecBuilder();
-
-		// Add image secrets if set
-		if (properties.getImagePullSecret() != null) {
-			podSpec.addNewImagePullSecret(properties.getImagePullSecret());
-		}
-
-		boolean hostNetwork = getHostNetwork(request);
-		Container container = containerFactory.create(appId, request, port, instanceIndex, hostNetwork);
-
-		// add memory and cpu resource limits
-		ResourceRequirements req = new ResourceRequirements();
-		req.setLimits(deduceResourceLimits(request));
-		req.setRequests(deduceResourceRequests(request));
-		container.setResources(req);
-		ImagePullPolicy pullPolicy = deduceImagePullPolicy(request);
-		container.setImagePullPolicy(pullPolicy.name());
-
-		// only add volumes with corresponding volume mounts
-		podSpec.withVolumes(getVolumes(request).stream()
-				.filter(volume -> container.getVolumeMounts().stream()
-						.anyMatch(volumeMount -> volumeMount.getName().equals(volume.getName())))
-				.collect(Collectors.toList()));
-
-		if (hostNetwork) {
-			podSpec.withHostNetwork(true);
-		}
-		podSpec.addToContainers(container);
-
-		if (neverRestart){
-			podSpec.withRestartPolicy("Never");
-		}
-
-		return podSpec.build();
-	}
-
-	/**
-	 * Volume deployment properties are specified in YAML format:
-	 *
-	 * <code>
-	 *     spring.cloud.deployer.openstack.volumes=[{name: testhostpath, hostPath: { path: '/test/override/hostPath' }},
-	 *     	{name: 'testpvc', persistentVolumeClaim: { claimName: 'testClaim', readOnly: 'true' }},
-	 *     	{name: 'testnfs', nfs: { server: '10.0.0.1:111', path: '/test/nfs' }}]
-	 * </code>
-	 *
-	 * Volumes can be specified as deployer properties as well as app deployment properties.
-	 * Deployment properties override deployer properties.
-	 *
-	 * @param request
-	 * @return the configured volumes
-	 */
-	protected List<Volume> getVolumes(AppDeploymentRequest request) {
-		List<Volume> volumes = new ArrayList<>();
-
-		String volumeDeploymentProperty = request.getDeploymentProperties()
-				.getOrDefault("spring.cloud.deployer.openstack.volumes", "");
-		if (!StringUtils.isEmpty(volumeDeploymentProperty)) {
-			YamlConfigurationFactory<OpenStackDeployerProperties> volumeYamlConfigurationFactory =
-					new YamlConfigurationFactory<>(OpenStackDeployerProperties.class);
-			volumeYamlConfigurationFactory.setYaml("{ volumes: " + volumeDeploymentProperty + " }");
-			try {
-				volumeYamlConfigurationFactory.afterPropertiesSet();
-				volumes.addAll(
-						volumeYamlConfigurationFactory.getObject().getVolumes());
-			}
-			catch (Exception e) {
-				throw new IllegalArgumentException(
-						String.format("Invalid volume '%s'", volumeDeploymentProperty), e);
-			}
-		}
-		// only add volumes that have not already been added, based on the volume's name
-		// i.e. allow provided deployment volumes to override deployer defined volumes
-		volumes.addAll(properties.getVolumes().stream()
-				.filter(volume -> volumes.stream()
-						.noneMatch(existingVolume -> existingVolume.getName().equals(volume.getName())))
-				.collect(Collectors.toList()));
-
-		return volumes;
-	}
-
-	/**
-	 * Get the resource limits for the deployment request. A Pod can define its maximum needed resources by setting the
-	 * limits and Kubernetes can provide more resources if any are free.
-	 * <p>
-	 * Falls back to the server properties if not present in the deployment request.
-	 * <p>
-	 * Also supports the deprecated properties {@code spring.cloud.deployer.openstack.memory/cpu}.
-	 *
-	 * @param request    The deployment properties.
-	 */
-	protected Map<String, Quantity> deduceResourceLimits(AppDeploymentRequest request) {
-		String memDeployer = getCommonDeployerMemory(request);
-		String memOverride = request.getDeploymentProperties().get("spring.cloud.deployer.openstack.memory");
-		if (memDeployer != null) {
-			if (memOverride == null) {
-				memOverride = memDeployer;
-			}
-			else {
-				logger.warn(String.format("Both " + AppDeployer.MEMORY_PROPERTY_KEY +
-								"=%s and spring.cloud.deployer.openstack.memory=%s specified, the latter will take precedence.",
-						memDeployer, memOverride));
-			}
-		}
-		String memLimitsOverride = request.getDeploymentProperties().get("spring.cloud.deployer.openstack.limits.memory");
-		if (memLimitsOverride != null) {
-			// Non-deprecated value has priority
-			memOverride = memLimitsOverride;
-		}
-
-		// Use server property if there is no request setting
-		if (memOverride == null) {
-			if (properties.getLimits().getMemory() != null) {
-				// Non-deprecated value has priority
-				memOverride = properties.getLimits().getMemory();
-			} else {
-				memOverride = properties.getMemory();
-			}
-		}
-
-		String cpuDeployer = request.getDeploymentProperties().get(AppDeployer.CPU_PROPERTY_KEY);
-		String cpuOverride = request.getDeploymentProperties().get("spring.cloud.deployer.openstack.cpu");
-		if (cpuDeployer != null) {
-			if (cpuOverride == null) {
-				cpuOverride = cpuDeployer;
-			}
-			else {
-				logger.warn(String.format("Both " + AppDeployer.CPU_PROPERTY_KEY +
-								"=%s and spring.cloud.deployer.openstack.cpu=%s specified, the latter will take precedence.",
-						cpuDeployer, cpuOverride));
-			}
-		}
-		String cpuLimitsOverride = request.getDeploymentProperties().get("spring.cloud.deployer.openstack.limits.cpu");
-		if (cpuLimitsOverride != null) {
-			// Non-deprecated value has priority
-			cpuOverride = cpuLimitsOverride;
-		}
-
-		// Use server property if there is no request setting
-		if (cpuOverride == null) {
-			if (properties.getLimits().getCpu() != null) {
-				// Non-deprecated value has priority
-				cpuOverride = properties.getLimits().getCpu();
-			} else {
-				cpuOverride = properties.getCpu();
-			}
-		}
-
-		logger.debug("Using limits - cpu: " + cpuOverride + " mem: " + memOverride);
-
-		Map<String,Quantity> limits = new HashMap<String,Quantity>();
-		limits.put("memory", new Quantity(memOverride));
-		limits.put("cpu", new Quantity(cpuOverride));
-		return limits;
-	}
-
-	/**
-	 * Get the image pull policy for the deployment request. If it is not present use the server default. If an override
-	 * for the deployment is present but not parseable, fall back to a default value.
-	 *
-	 * @param request The deployment request.
-	 * @return The image pull policy to use for the container in the request.
-	 */
-	protected ImagePullPolicy deduceImagePullPolicy(AppDeploymentRequest request) {
-		String pullPolicyOverride =
-				request.getDeploymentProperties().get("spring.cloud.deployer.openstack.imagePullPolicy");
-
-		ImagePullPolicy pullPolicy;
-		if (pullPolicyOverride == null) {
-			pullPolicy = properties.getImagePullPolicy();
-		} else {
-			pullPolicy = ImagePullPolicy.relaxedValueOf(pullPolicyOverride);
-			if (pullPolicy == null) {
-				logger.warn("Parsing of pull policy " + pullPolicyOverride + " failed, using default \"Always\".");
-				pullPolicy = ImagePullPolicy.Always;
-			}
-		}
-		logger.debug("Using imagePullPolicy " + pullPolicy);
-		return pullPolicy;
-	}
-
-	/**
-	 * Get the resource requests for the deployment request. Resource requests are guaranteed by the Kubernetes
-	 * runtime.
-	 * Falls back to the server properties if not present in the deployment request.
-	 *
-	 * @param request    The deployment properties.
-	 */
-	protected Map<String, Quantity> deduceResourceRequests(AppDeploymentRequest request) {
-		String memOverride = request.getDeploymentProperties().get("spring.cloud.deployer.openstack.requests.memory");
-		if (memOverride == null) {
-			memOverride = properties.getRequests().getMemory();
-		}
-
-		String cpuOverride = request.getDeploymentProperties().get("spring.cloud.deployer.openstack.requests.cpu");
-		if (cpuOverride == null) {
-			cpuOverride = properties.getRequests().getCpu();
-		}
-
-		logger.debug("Using requests - cpu: " + cpuOverride + " mem: " + memOverride);
-
-		Map<String,Quantity> requests = new HashMap<String, Quantity>();
-		if (memOverride != null) {
-			requests.put("memory", new Quantity(memOverride));
-		}
-		if (cpuOverride != null) {
-			requests.put("cpu", new Quantity(cpuOverride));
-		}
-		return requests;
-	}
-
-	/**
-	 * Get the hostNetwork setting for the deployment request.
-	 *
-	 * @param request The deployment request.
-	 * @return Whether host networking is requested
-	 */
-	protected boolean getHostNetwork(AppDeploymentRequest request) {
-		String hostNetworkOverride =
-				request.getDeploymentProperties().get("spring.cloud.deployer.openstack.hostNetwork");
-		boolean hostNetwork;
-		if (StringUtils.isEmpty(hostNetworkOverride)) {
-			hostNetwork = properties.isHostNetwork();
-		}
-		else {
-			hostNetwork = Boolean.valueOf(hostNetworkOverride);
-		}
-		logger.debug("Using hostNetwork " + hostNetwork);
-		return hostNetwork;
-	}
-
-	private String getCommonDeployerMemory(AppDeploymentRequest request) {
-		String mem = request.getDeploymentProperties().get(AppDeployer.MEMORY_PROPERTY_KEY);
-		if (mem == null) {
-			return null;
-		}
-		long memAmount = ByteSizeUtils.parseToMebibytes(mem);
-		return memAmount + "Mi";
 	}
 
 }

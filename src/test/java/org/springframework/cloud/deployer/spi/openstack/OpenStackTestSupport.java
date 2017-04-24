@@ -16,6 +16,8 @@
 
 package org.springframework.cloud.deployer.spi.openstack;
 
+import org.openstack4j.api.OSClient;
+import org.openstack4j.openstack.OSFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -25,21 +27,16 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import io.fabric8.kubernetes.client.DefaultKubernetesClient;
-import io.fabric8.kubernetes.client.KubernetesClient;
-
 /**
- * JUnit {@link org.junit.Rule} that detects the fact that a Kubernetes installation is available.
- *
- * @author Thomas Risberg
+ * JUnit {@link org.junit.Rule} that detects the fact that a OpenStack installation is available.
  */
-public class OpenStackTestSupport extends AbstractExternalResourceTestSupport<KubernetesClient> {
+public class OpenStackTestSupport extends AbstractExternalResourceTestSupport<OSClient> {
 
 	private ConfigurableApplicationContext context;
 
 
 	protected OpenStackTestSupport() {
-		super("KUBERNETES");
+		super("OPENSTACK");
 	}
 
 	@Override
@@ -50,8 +47,7 @@ public class OpenStackTestSupport extends AbstractExternalResourceTestSupport<Ku
 	@Override
 	protected void obtainResource() throws Exception {
 		context = new SpringApplicationBuilder(Config.class).web(false).run();
-		resource = context.getBean(KubernetesClient.class);
-		resource.namespaces().list();
+		resource = context.getBean(OSClient.class);
 	}
 
 	@Configuration
@@ -63,8 +59,12 @@ public class OpenStackTestSupport extends AbstractExternalResourceTestSupport<Ku
 		private OpenStackDeployerProperties properties;
 
 		@Bean
-		public KubernetesClient kubernetesClient() {
-			return new DefaultKubernetesClient().inNamespace(properties.getNamespace());
+		public OSClient osClient() {
+			return OSFactory.builderV2()
+					.endpoint(properties.getEndpoint())
+					.credentials(properties.getUserId(),properties.getPassword())
+					.tenantName(properties.getTenantName())
+					.authenticate();
 		}
 	}
 }

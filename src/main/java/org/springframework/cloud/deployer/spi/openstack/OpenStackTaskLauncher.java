@@ -16,13 +16,12 @@
 
 package org.springframework.cloud.deployer.spi.openstack;
 
-import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.PodList;
-import io.fabric8.kubernetes.api.model.PodSpec;
-import io.fabric8.kubernetes.api.model.PodStatus;
-import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.KubernetesClientException;
+import com.google.common.collect.ImmutableMap;
 import org.hashids.Hashids;
+import org.openstack4j.api.OSClient;
+import org.openstack4j.model.common.ActionResponse;
+import org.openstack4j.model.compute.Server;
+import org.openstack4j.model.compute.ServerCreate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.deployer.spi.core.AppDeploymentRequest;
 import org.springframework.cloud.deployer.spi.core.RuntimeEnvironmentInfo;
@@ -35,25 +34,19 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.openstack4j.api.Builders.server;
+import static org.openstack4j.model.compute.Action.SUSPEND;
+import static org.openstack4j.model.compute.Server.Status.*;
+
 /**
- * A task launcher that targets Kubernetes.
- *
- * @author Thomas Risberg
+ * A task launcher that targets OpenStack.
  */
 public class OpenStackTaskLauncher extends AbstractOpenStackDeployer implements TaskLauncher {
 
 	@Autowired
-	public OpenStackTaskLauncher(OpenStackDeployerProperties properties,
-								 KubernetesClient client) {
-		this(properties, client, new DefaultContainerFactory(properties));
-	}
-
-	@Autowired
-	public OpenStackTaskLauncher(OpenStackDeployerProperties properties,
-								 KubernetesClient client, ContainerFactory containerFactory) {
+	public OpenStackTaskLauncher(OpenStackDeployerProperties properties, OSClient client) {
 		this.properties = properties;
 		this.client = client;
-		this.containerFactory = containerFactory;
 	}
 
 	@Override
@@ -67,7 +60,7 @@ public class OpenStackTaskLauncher extends AbstractOpenStackDeployer implements 
 
 		logger.debug(String.format("Launching pod for task: %s", appId));
 		try {
-			createPod(appId, request, idMap);
+			createTask(appId, request, idMap);
 			return appId;
 		} catch (RuntimeException e) {
 			logger.error(e.getMessage(), e);
@@ -78,7 +71,6 @@ public class OpenStackTaskLauncher extends AbstractOpenStackDeployer implements 
 	@Override
 	public void cancel(String id) {
 		logger.debug(String.format("Cancelling task: %s", id));
-		//ToDo: what does cancel mean? Kubernetes doesn't have stop - just cleanup
 		cleanup(id);
 	}
 
@@ -113,49 +105,54 @@ public class OpenStackTaskLauncher extends AbstractOpenStackDeployer implements 
 		Hashids hashids = new Hashids(name, 0, "abcdefghijklmnopqrstuvwxyz1234567890");
 		String hashid = hashids.encode(System.currentTimeMillis());
 		String deploymentId = name + "-" + hashid;
-		// Kubernetes does not allow . in the name and does not allow uppercase in the name
+		// OpenStack does not allow . in the name and does not allow uppercase in the name
 		return deploymentId.replace('.', '-').toLowerCase();
 	}
 
-	private void createPod(String appId, AppDeploymentRequest request, Map<String, String> idMap) {
-		Map<String, String> podLabelMap = new HashMap<>();
-		podLabelMap.put("task-name", request.getDefinition().getName());
-		podLabelMap.put(SPRING_MARKER_KEY, SPRING_MARKER_VALUE);
-		PodSpec spec = createPodSpec(appId, request, null, null, true);
-		client.pods()
-				.inNamespace(client.getNamespace()).createNew()
-				.withNewMetadata()
-				.withName(appId)
-				.withLabels(podLabelMap)
-				.addToLabels(idMap)
-				.endMetadata()
-				.withSpec(spec)
-				.done();
+	private void createTask(String appId, AppDeploymentRequest request, Map<String, String> idMap) {
+		Map<String, String> labelMap = new HashMap<>();
+		labelMap.put("task-name", request.getDefinition().getName());
+		labelMap.put(SPRING_MARKER_KEY, SPRING_MARKER_VALUE);
+
+		// Create a Server Model Object
+		ServerCreate sc = server()
+				.name(appId)
+				.flavor("flavorId")
+				.image("imageId")
+				.addMetadata(idMap)
+				.addMetadata(labelMap)
+				.build();
+
+		// Boot the Server
+		Server server = client
+				.compute()
+				.servers()
+				.boot(sc);
+
 	}
 
 	private List<String> getPodIdsForTaskName(String taskName) {
 		List<String> ids = new ArrayList<>();
-		try {
-			PodList pods = client.pods().inNamespace(client.getNamespace()).withLabel("task-name", taskName).list();
-			for (Pod pod : pods.getItems()) {
-				ids.add(pod.getMetadata().getName());
-			}
-		}
-		catch (KubernetesClientException kce) {
-			logger.warn(String.format("Failed to retrieve pods for task: %s", taskName), kce);
+		List<? extends Server> servers = client.compute().servers().list(ImmutableMap.of("task-name", taskName));
+		for (Server server : servers) {
+			ids.add(server.getName());
 		}
 		return ids;
 	}
 
-	private void deletePod(String id) {
+
+	private void deletePod(String appId) {
 		try {
-			Boolean podDeleted = client.pods().inNamespace(client.getNamespace()).withName(id).delete();
-			if (podDeleted) {
-				logger.debug(String.format("Deleted pod successfully: %s", id));
-			}
-			else {
-				logger.debug(String.format("Delete failed for pod: %s", id));
-			}
+			// Suspend Server
+			logger.debug(String.format("Suspending service: %s", appId));
+			ActionResponse suspensionResponse = client.compute().servers().action(appId, SUSPEND);
+			logger.debug(String.format("Suspension status: %s", suspensionResponse));
+
+			// Delete Server
+			logger.debug(String.format("Deleting service: %s", appId));
+			ActionResponse deletionResponse = client.compute().servers().delete(appId);
+			logger.debug(String.format("Deletion status: %s", deletionResponse));
+
 		} catch (RuntimeException e) {
 			logger.error(e.getMessage(), e);
 			throw e;
@@ -163,30 +160,27 @@ public class OpenStackTaskLauncher extends AbstractOpenStackDeployer implements 
 	}
 
 	TaskStatus buildTaskStatus(String id) {
-		Pod pod = client.pods().inNamespace(client.getNamespace()).withName(id).get();
-		if (pod == null) {
+		Server server = client.compute().servers().get(id);
+		if (server == null) {
 			return new TaskStatus(id, LaunchState.unknown, new HashMap<>());
 		}
-		PodStatus podStatus = pod.getStatus();
-		if (podStatus == null) {
+		Server.Status serverStatus = server.getStatus();
+		if (serverStatus == null) {
 			return new TaskStatus(id, LaunchState.unknown, new HashMap<>());
 		}
-		if (podStatus.getPhase() != null) {
-			if (podStatus.getPhase().equals("Pending")) {
+		else {
+			if (serverStatus == BUILD) {
 				return new TaskStatus(id, LaunchState.launching, new HashMap<>());
 			}
-			else if (podStatus.getPhase().equals("Failed")) {
+			else if (serverStatus == ERROR) {
 				return new TaskStatus(id, LaunchState.failed, new HashMap<>());
 			}
-			else if (podStatus.getPhase().equals("Succeeded")) {
+			else if (serverStatus == ACTIVE) {
 				return new TaskStatus(id, LaunchState.complete, new HashMap<>());
 			}
 			else {
 				return new TaskStatus(id, LaunchState.running, new HashMap<>());
 			}
-		}
-		else {
-			return new TaskStatus(id, LaunchState.launching, new HashMap<>());
 		}
 	}
 

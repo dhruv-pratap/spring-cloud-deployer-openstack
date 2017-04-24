@@ -16,51 +16,36 @@
 
 package org.springframework.cloud.deployer.spi.openstack;
 
-import io.fabric8.kubernetes.api.model.*;
-import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.Watch;
-import io.fabric8.kubernetes.client.Watcher;
-import io.fabric8.kubernetes.client.dsl.FilterWatchListDeletable;
 import org.openstack4j.api.OSClient;
+import org.openstack4j.model.common.ActionResponse;
 import org.openstack4j.model.compute.Server;
+import org.openstack4j.model.compute.ServerCreate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.deployer.spi.app.AppDeployer;
 import org.springframework.cloud.deployer.spi.app.AppStatus;
 import org.springframework.cloud.deployer.spi.app.DeploymentState;
 import org.springframework.cloud.deployer.spi.core.AppDeploymentRequest;
 import org.springframework.cloud.deployer.spi.core.RuntimeEnvironmentInfo;
-import org.springframework.util.CollectionUtils;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.openstack4j.api.Builders.server;
+import static org.openstack4j.model.compute.Action.SUSPEND;
 import static org.springframework.util.CollectionUtils.isEmpty;
 
 /**
- * A deployer that targets Kubernetes.
- *
- * @author Florian Rosenberg
- * @author Thomas Risberg
- * @author Mark Fisher
- * @author Donovan Muller
+ * A deployer that targets OpenStack.
  */
 public class OpenStackAppDeployer extends AbstractOpenStackDeployer implements AppDeployer {
 
 	private static final String SERVER_PORT_KEY = "server.port";
 
 	@Autowired
-	public OpenStackAppDeployer(OpenStackDeployerProperties properties,
-								OSClient client) {
-		this(properties, client, new DefaultContainerFactory(properties));
-	}
-
-	@Autowired
-	public OpenStackAppDeployer(OpenStackDeployerProperties properties,
-								OSClient client, ContainerFactory containerFactory) {
+	public OpenStackAppDeployer(OpenStackDeployerProperties properties, OSClient client) {
 		this.properties = properties;
 		this.client = client;
-		this.containerFactory = containerFactory;
 	}
 
 	@Override
@@ -88,17 +73,13 @@ public class OpenStackAppDeployer extends AbstractOpenStackDeployer implements A
 					String indexedId = appId + "-" + index;
 					Map<String, String> idMap = createIdMap(appId, request, index);
 					logger.debug(String.format("Creating service: %s on %d with index %d", appId, externalPort, index));
-					createService(indexedId, request, idMap, externalPort);
-					logger.debug(String.format("Creating repl controller: %s with index %d", appId, index));
-					createReplicationController(indexedId, request, idMap, externalPort, 1, index);
+					createApplication(indexedId, request, idMap, externalPort);
 				}
 			}
 			else {
 				Map<String, String> idMap = createIdMap(appId, request, null);
 				logger.debug(String.format("Creating service: %s on {}", appId, externalPort));
-				createService(appId, request, idMap, externalPort);
-				logger.debug(String.format("Creating repl controller: %s", appId));
-				createReplicationController(appId, request, idMap, externalPort, count, null);
+				createApplication(appId, request, idMap, externalPort);
 			}
 
 			return appId;
@@ -115,59 +96,15 @@ public class OpenStackAppDeployer extends AbstractOpenStackDeployer implements A
 		if (status.getState().equals(DeploymentState.unknown)) {
 			throw new IllegalStateException(String.format("App '%s' is not deployed", appId));
 		}
-		List<ReplicationController> apps =
-			client.replicationControllers().withLabel(SPRING_APP_KEY, appId).list().getItems();
-		if (apps != null) {
-			for (ReplicationController rc : apps) {
-				String appIdToDelete = rc.getMetadata().getName();
-				logger.debug(String.format("Deleting svc, rc and pods for: %s", appIdToDelete));
 
-				Service svc = client.services().withName(appIdToDelete).get();
-				try {
-					if (svc != null && "LoadBalancer".equals(svc.getSpec().getType())) {
-						int tries = 0;
-						int maxWait = properties.getMinutesToWaitForLoadBalancer() * 6; // we check 6 times per minute
-						while (tries++ < maxWait) {
-							if (svc.getStatus() != null && svc.getStatus().getLoadBalancer() != null &&
-									svc.getStatus().getLoadBalancer().getIngress() != null &&
-									svc.getStatus().getLoadBalancer().getIngress().isEmpty()) {
-								if (tries % 6 == 0) {
-									logger.warn("Waiting for LoadBalancer to complete before deleting it ...");
-								}
-								logger.debug(String.format("Waiting for LoadBalancer, try %d", tries));
-								try {
-									Thread.sleep(10000L);
-								} catch (InterruptedException e) {
-								}
-								svc = client.services().withName(appIdToDelete).get();
-							} else {
-								break;
-							}
-						}
-						logger.debug(String.format("LoadBalancer Ingress: %s",
-								svc.getStatus().getLoadBalancer().getIngress().toString()));
-					}
-					Boolean svcDeleted = client.services().withName(appIdToDelete).delete();
-					logger.debug(String.format("Deleted service for: %s %b", appIdToDelete, svcDeleted));
-					Boolean rcDeleted = client.replicationControllers().withName(appIdToDelete).delete();
-					logger.debug(String.format("Deleted replication controller for: %s %b", appIdToDelete, rcDeleted));
-					Map<String, String> selector = new HashMap<>();
-					selector.put(SPRING_APP_KEY, appIdToDelete);
-					FilterWatchListDeletable<Pod, PodList, Boolean, Watch, Watcher<Pod>> podsToDelete =
-							client.pods().withLabels(selector);
-					if (podsToDelete != null && podsToDelete.list().getItems() != null) {
-						Boolean podDeleted = podsToDelete.delete();
-						logger.debug(String.format("Deleted pods for: %s %b", appIdToDelete, podDeleted));
-					} else {
-						logger.debug(String.format("No pods to delete for: %s", appIdToDelete));
-					}
-				} catch (RuntimeException e) {
-					logger.error(e.getMessage(), e);
-					throw e;
-				}
-			}
+		try {
+			deleteApplication(appId);
+		} catch (RuntimeException e) {
+			logger.error(e.getMessage(), e);
+			throw e;
 		}
 	}
+
 
 	@Override
 	public AppStatus status(String appId) {
@@ -213,84 +150,41 @@ public class OpenStackAppDeployer extends AbstractOpenStackDeployer implements A
 		else {
 			deploymentId = String.format("%s-%s", groupId, request.getDefinition().getName());
 		}
-		// Kubernetes does not allow . in the name and does not allow uppercase in the name
+		// OpenStack does not allow . in the name and does not allow uppercase in the name
 		return deploymentId.replace('.', '-').toLowerCase();
 	}
 
-	private ReplicationController createReplicationController(
-			String appId, AppDeploymentRequest request,
-			Map<String, String> idMap, int externalPort, int replicas, Integer instanceIndex) {
-		ReplicationController rc = new ReplicationControllerBuilder()
-				.withNewMetadata()
-					.withName(appId)
-					.withLabels(idMap)
-						.addToLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE)
-				.endMetadata()
-				.withNewSpec()
-					.withReplicas(replicas)
-					.withSelector(idMap)
-					.withNewTemplate()
-						.withNewMetadata()
-							.withLabels(idMap)
-								.addToLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE)
-						.endMetadata()
-						.withSpec(createPodSpec(appId, request, Integer.valueOf(externalPort), instanceIndex, false))
-					.endTemplate()
-				.endSpec()
-				.build();
+	private void createApplication(String appId, AppDeploymentRequest request, Map<String, String> idMap, int externalPort) {
 
-		return client.replicationControllers().create(rc);
+		// Create a Server Model Object
+		ServerCreate sc = server()
+							.name(appId)
+							.flavor("flavorId")
+							.image("imageId")
+							.addMetadata(idMap)
+							.addMetadataItem(SPRING_MARKER_KEY, SPRING_MARKER_VALUE)
+//							.addNetworkPort(externalPort)
+							.build();
+
+		// Boot the Server
+		Server server = client
+							.compute()
+							.servers()
+							.boot(sc);
+
 	}
 
-	private void createService(String appId, AppDeploymentRequest request, Map<String, String> idMap, int externalPort) {
-		ServiceSpecBuilder spec = new ServiceSpecBuilder();
-		boolean isCreateLoadBalancer = false;
-		String createLoadBalancer = request.getDeploymentProperties().get("spring.cloud.deployer.openstack.createLoadBalancer");
-		String createNodePort = request.getDeploymentProperties().get("spring.cloud.deployer.openstack.createNodePort");
 
-		if (createLoadBalancer != null && createNodePort != null) {
-			throw new IllegalArgumentException("Cannot create NodePort and LoadBalancer at the same time.");
-		}
+	private void deleteApplication(String appId) {
+		// Suspend Server
+		logger.debug(String.format("Suspending service: %s", appId));
+		ActionResponse suspensionResponse = client.compute().servers().action(appId, SUSPEND);
+		logger.debug(String.format("Suspension status: %s", suspensionResponse));
 
-		if (createLoadBalancer == null) {
-			isCreateLoadBalancer = properties.isCreateLoadBalancer();
-		}
-		else {
-			if ("true".equals(createLoadBalancer.toLowerCase())) {
-				isCreateLoadBalancer = true;
-			}
-		}
-
-		if (isCreateLoadBalancer) {
-			spec.withType("LoadBalancer");
-		}
-
-		ServicePort servicePort = new ServicePort();
-		servicePort.setPort(externalPort);
-
-		if (createNodePort != null) {
-			spec.withType("NodePort");
-			if (!"true".equals(createNodePort.toLowerCase())) {
-				try {
-					Integer nodePort = Integer.valueOf(createNodePort);
-					servicePort.setNodePort(nodePort);
-				} catch (NumberFormatException e) {
-					throw new IllegalArgumentException(String.format("Invalid value: %s: provided port is not valid.", createNodePort));
-				}
-			}
-		}
-
-		spec.withSelector(idMap)
-			.addNewPortLike(servicePort).endPort();
-
-		client.services().inNamespace(client.getNamespace()).createNew()
-				.withNewMetadata()
-					.withName(appId)
-					.withLabels(idMap)
-					.addToLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE)
-					.endMetadata()
-				.withSpec(spec.build())
-				.done();
+		// Delete Server
+		logger.debug(String.format("Deleting service: %s", appId));
+		ActionResponse deletionResponse = client.compute().servers().delete(appId);
+		logger.debug(String.format("Deletion status: %s", deletionResponse));
 	}
 
 }

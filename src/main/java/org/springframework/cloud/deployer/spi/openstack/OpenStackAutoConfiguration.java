@@ -16,9 +16,8 @@
 
 package org.springframework.cloud.deployer.spi.openstack;
 
-import io.fabric8.kubernetes.client.DefaultKubernetesClient;
-import io.fabric8.kubernetes.client.KubernetesClient;
-
+import org.openstack4j.api.OSClient;
+import org.openstack4j.openstack.OSFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.AutoConfigureOrder;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -30,9 +29,6 @@ import org.springframework.core.Ordered;
 
 /**
  * Spring Bean configuration for the {@link OpenStackAppDeployer}.
- *
- * @author Florian Rosenberg
- * @author Thomas Risberg
  */
 @Configuration
 @EnableConfigurationProperties(OpenStackDeployerProperties.class)
@@ -43,25 +39,21 @@ public class OpenStackAutoConfiguration {
 	private OpenStackDeployerProperties properties;
 
 	@Bean
-	public AppDeployer appDeployer(KubernetesClient kubernetesClient,
-	                               ContainerFactory containerFactory) {
-		return new OpenStackAppDeployer(properties, kubernetesClient, containerFactory);
+	public AppDeployer appDeployer(OSClient osClient) {
+		return new OpenStackAppDeployer(properties, osClient);
 	}
 
 	@Bean
-	public TaskLauncher taskDeployer(KubernetesClient kubernetesClient,
-	                                 ContainerFactory containerFactory) {
-		return new OpenStackTaskLauncher(properties, kubernetesClient, containerFactory);
+	public TaskLauncher taskDeployer(OSClient osClient) {
+		return new OpenStackTaskLauncher(properties, osClient);
 	}
 
 	@Bean
-	public KubernetesClient kubernetesClient() {
-		return new DefaultKubernetesClient().inNamespace(properties.getNamespace());
+	public OSClient osClient() {
+		return OSFactory.builderV2()
+				.endpoint(properties.getEndpoint())
+				.credentials(properties.getUserId(),properties.getPassword())
+				.tenantName(properties.getTenantName())
+				.authenticate();
 	}
-
-	@Bean
-	public ContainerFactory containerFactory() {
-		return new DefaultContainerFactory(properties);
-	}
-
 }

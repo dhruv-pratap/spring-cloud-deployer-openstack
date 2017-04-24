@@ -32,14 +32,12 @@ import org.springframework.core.io.Resource;
 
 /**
  * Integration tests for {@link OpenStackTaskLauncher}.
- *
- * @author Thomas Risberg
  */
 @SpringBootTest(classes = {OpenStackAutoConfiguration.class})
 public class OpenStackTaskLauncherIntegrationTests extends AbstractTaskLauncherIntegrationTests {
 
 	@ClassRule
-	public static OpenStackTestSupport kubernetesAvailable = new OpenStackTestSupport();
+	public static OpenStackTestSupport openStackTestSupport = new OpenStackTestSupport();
 
 	@Autowired
 	private TaskLauncher taskLauncher;

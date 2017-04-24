@@ -29,8 +29,6 @@ import static org.springframework.util.ObjectUtils.nullSafeToString;
 
 /**
  * Represents the status of a module.
- *
- * @author Dhruv Pratap
  */
 public class OpenStackAppInstanceStatus implements AppInstanceStatus {
 

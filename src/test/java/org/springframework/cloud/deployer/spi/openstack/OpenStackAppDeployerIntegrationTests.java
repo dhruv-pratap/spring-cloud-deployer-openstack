@@ -16,32 +16,10 @@
 
 package org.springframework.cloud.deployer.spi.openstack;
 
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.notNullValue;
-import static org.junit.Assert.assertThat;
-import static org.springframework.cloud.deployer.spi.app.DeploymentState.deployed;
-import static org.springframework.cloud.deployer.spi.app.DeploymentState.failed;
-import static org.springframework.cloud.deployer.spi.app.DeploymentState.unknown;
-import static org.springframework.cloud.deployer.spi.openstack.AbstractOpenStackDeployer.SPRING_APP_KEY;
-import static org.springframework.cloud.deployer.spi.test.EventuallyMatcher.eventually;
-
-import java.io.IOException;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
-
-import io.fabric8.kubernetes.api.model.EnvVar;
-import io.fabric8.kubernetes.api.model.HostPathVolumeSource;
-import io.fabric8.kubernetes.api.model.PodSpec;
-import io.fabric8.kubernetes.api.model.Volume;
-import io.fabric8.kubernetes.api.model.VolumeBuilder;
-import io.fabric8.kubernetes.api.model.VolumeMount;
-import io.fabric8.kubernetes.client.KubernetesClient;
 import org.hamcrest.Matchers;
 import org.junit.ClassRule;
 import org.junit.Test;
-
+import org.openstack4j.api.OSClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.cloud.deployer.resource.docker.DockerResource;
@@ -52,23 +30,31 @@ import org.springframework.cloud.deployer.spi.test.AbstractAppDeployerIntegratio
 import org.springframework.cloud.deployer.spi.test.Timeout;
 import org.springframework.core.io.Resource;
 
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+import static org.hamcrest.Matchers.is;
+import static org.junit.Assert.assertThat;
+import static org.springframework.cloud.deployer.spi.app.DeploymentState.deployed;
+import static org.springframework.cloud.deployer.spi.app.DeploymentState.unknown;
+import static org.springframework.cloud.deployer.spi.test.EventuallyMatcher.eventually;
+
 /**
  * Integration tests for {@link OpenStackAppDeployer}.
- *
- * @author Thomas Risberg
- * @author Donovan Muller
  */
 @SpringBootTest(classes = {OpenStackAutoConfiguration.class})
 public class OpenStackAppDeployerIntegrationTests extends AbstractAppDeployerIntegrationTests {
 
 	@ClassRule
-	public static OpenStackTestSupport kubernetesAvailable = new OpenStackTestSupport();
+	public static OpenStackTestSupport openStackTestSupport = new OpenStackTestSupport();
 
 	@Autowired
 	private AppDeployer appDeployer;
 
 	@Autowired
-	KubernetesClient kubernetesClient;
+	OSClient osClient;
 
 	@Override
 	protected AppDeployer provideAppDeployer() {
@@ -76,111 +62,10 @@ public class OpenStackAppDeployerIntegrationTests extends AbstractAppDeployerInt
 	}
 
 	@Test
-	public void testFailedDeploymentWithLoadBalancer() {
-		log.info("Testing {}...", "FailedDeploymentWithLoadBalancer");
-		OpenStackDeployerProperties lbProperties = new OpenStackDeployerProperties();
-		lbProperties.setCreateLoadBalancer(true);
-		lbProperties.setLivenessProbePeriod(10);
-		lbProperties.setMaxTerminatedErrorRestarts(1);
-		lbProperties.setMaxCrashLoopBackOffRestarts(1);
-		ContainerFactory containerFactory = new DefaultContainerFactory(lbProperties);
-		OpenStackAppDeployer lbAppDeployer = new OpenStackAppDeployer(lbProperties, kubernetesClient, containerFactory);
-
-		AppDefinition definition = new AppDefinition(randomName(), null);
-		Resource resource = testApplication();
-		Map<String, String> props = new HashMap<>();
-		// setting to small memory value will cause app to fail to be deployed
-		props.put("spring.cloud.deployer.openstack.memory", "8Mi");
-		AppDeploymentRequest request = new AppDeploymentRequest(definition, resource, props);
-
-		log.info("Deploying {}...", request.getDefinition().getName());
-		String deploymentId = lbAppDeployer.deploy(request);
-		Timeout timeout = deploymentTimeout();
-		assertThat(deploymentId, eventually(hasStatusThat(
-				Matchers.hasProperty("state", is(failed))), timeout.maxAttempts, timeout.pause));
-
-		log.info("Undeploying {}...", deploymentId);
-		timeout = undeploymentTimeout();
-		lbAppDeployer.undeploy(deploymentId);
-		assertThat(deploymentId, eventually(hasStatusThat(
-				Matchers.hasProperty("state", is(unknown))), timeout.maxAttempts, timeout.pause));
-	}
-
-	@Test
-	public void testGoodDeploymentWithLoadBalancer() {
-		log.info("Testing {}...", "GoodDeploymentWithLoadBalancer");
-		OpenStackDeployerProperties lbProperties = new OpenStackDeployerProperties();
-		lbProperties.setCreateLoadBalancer(true);
-		lbProperties.setMinutesToWaitForLoadBalancer(1);
-		ContainerFactory containerFactory = new DefaultContainerFactory(lbProperties);
-		OpenStackAppDeployer lbAppDeployer = new OpenStackAppDeployer(lbProperties, kubernetesClient, containerFactory);
-
-		AppDefinition definition = new AppDefinition(randomName(), null);
-		Resource resource = testApplication();
-		AppDeploymentRequest request = new AppDeploymentRequest(definition, resource);
-
-		log.info("Deploying {}...", request.getDefinition().getName());
-		String deploymentId = lbAppDeployer.deploy(request);
-		Timeout timeout = deploymentTimeout();
-		assertThat(deploymentId, eventually(hasStatusThat(
-				Matchers.hasProperty("state", is(deployed))), timeout.maxAttempts, timeout.pause));
-
-		log.info("Undeploying {}...", deploymentId);
-		timeout = undeploymentTimeout();
-		lbAppDeployer.undeploy(deploymentId);
-		assertThat(deploymentId, eventually(hasStatusThat(
-				Matchers.hasProperty("state", is(unknown))), timeout.maxAttempts, timeout.pause));
-	}
-
-	@Test
-	public void testDeploymentWithMountedHostPathVolume() throws IOException {
-		log.info("Testing {}...", "DeploymentWithMountedVolume");
-		String hostPath = "/tmp/" + randomName() + '/';
-		String containerPath = "/tmp/";
-		String subPath = randomName();
-		String mountName = "mount";
-		OpenStackDeployerProperties deployProperties = new OpenStackDeployerProperties();
-		deployProperties.setVolumes(Collections.singletonList(new VolumeBuilder()
-				.withHostPath(new HostPathVolumeSource(hostPath))
-				.withName(mountName)
-				.build()));
-		deployProperties.setVolumeMounts(Collections.singletonList(new VolumeMount(hostPath, mountName, false, null)));
-		ContainerFactory containerFactory = new DefaultContainerFactory(deployProperties);
-		OpenStackAppDeployer lbAppDeployer = new OpenStackAppDeployer(deployProperties, kubernetesClient, containerFactory);
-
-		AppDefinition definition = new AppDefinition(randomName(), Collections.singletonMap("logging.file", containerPath + subPath));
-		Resource resource = testApplication();
-		AppDeploymentRequest request = new AppDeploymentRequest(definition, resource);
-
-		log.info("Deploying {}...", request.getDefinition().getName());
-		String deploymentId = lbAppDeployer.deploy(request);
-		Timeout timeout = deploymentTimeout();
-		assertThat(deploymentId, eventually(hasStatusThat(
-				Matchers.hasProperty("state", is(deployed))), timeout.maxAttempts, timeout.pause));
-
-		Map<String, String> selector = Collections.singletonMap(SPRING_APP_KEY, deploymentId);
-		PodSpec spec = kubernetesClient.pods().withLabels(selector).list().getItems().get(0).getSpec();
-		assertThat(spec.getVolumes(), is(notNullValue()));
-		Volume volume = spec.getVolumes().stream()
-				.filter(v -> mountName.equals(v.getName()))
-				.findAny()
-				.orElseThrow(() -> new AssertionError("Volume not mounted"));
-		assertThat(volume.getHostPath(), is(notNullValue()));
-		assertThat(hostPath, is(volume.getHostPath().getPath()));
-
-		log.info("Undeploying {}...", deploymentId);
-		timeout = undeploymentTimeout();
-		lbAppDeployer.undeploy(deploymentId);
-		assertThat(deploymentId, eventually(hasStatusThat(
-				Matchers.hasProperty("state", is(unknown))), timeout.maxAttempts, timeout.pause));
-	}
-
-	@Test
 	public void testDeploymentWithGroupAndIndex() throws IOException {
 		log.info("Testing {}...", "DeploymentWithWithGroupAndIndex");
 		OpenStackDeployerProperties deployProperties = new OpenStackDeployerProperties();
-		ContainerFactory containerFactory = new DefaultContainerFactory(deployProperties);
-		OpenStackAppDeployer testAppDeployer = new OpenStackAppDeployer(deployProperties, kubernetesClient, containerFactory);
+		OpenStackAppDeployer testAppDeployer = new OpenStackAppDeployer(deployProperties, osClient);
 
 		AppDefinition definition = new AppDefinition(randomName(), new HashMap<>());
 		Resource resource = testApplication();
@@ -195,15 +80,6 @@ public class OpenStackAppDeployerIntegrationTests extends AbstractAppDeployerInt
 		assertThat(deploymentId, eventually(hasStatusThat(
 				Matchers.hasProperty("state", is(deployed))), timeout.maxAttempts, timeout.pause));
 
-		Map<String, String> selector = Collections.singletonMap(SPRING_APP_KEY, deploymentId);
-		PodSpec spec = kubernetesClient.pods().withLabels(selector).list().getItems().get(0).getSpec();
-		Map<String, String> envVars = new HashMap<>();
-		for (EnvVar e : spec.getContainers().get(0).getEnv()) {
-			envVars.put(e.getName(), e.getValue());
-		}
-		assertThat(envVars.get("SPRING_CLOUD_APPLICATION_GROUP"), is("foo"));
-		assertThat(envVars.get("SPRING_APPLICATION_INDEX"), is("0"));
-
 		log.info("Undeploying {}...", deploymentId);
 		timeout = undeploymentTimeout();
 		testAppDeployer.undeploy(deploymentId);
@@ -213,7 +89,6 @@ public class OpenStackAppDeployerIntegrationTests extends AbstractAppDeployerInt
 
 	@Override
 	protected String randomName() {
-		// Kubernetest service names must start with a letter and can only be 24 characters long
 		return "app-" + UUID.randomUUID().toString().substring(0, 18);
 	}
 
